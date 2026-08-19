@@ -4,49 +4,20 @@ Tài liệu này hướng dẫn chi tiết cách cấu hình hệ thống OpenSt
 
 ---
 
-## 1. Kiến Trúc Hệ Thống (Multi-Node Cluster)
+## 1. Kiến Trúc Hệ Thống (Multi-Node Cluster qua Tailscale VPN)
 
-Thay vì chạy toàn bộ OpenStack trên một VM duy nhất (gây quá tải phần cứng), chúng ta sẽ chia tải như sau:
-*   **Control Node (Mini PC - IP `192.168.1.100`)**: Chạy các dịch vụ quản lý như Keystone, Glance, Horizon, Neutron Server, Heat, Cinder API/Scheduler, Swift, MySQL và RabbitMQ. Tắt dịch vụ hypervisor/chạy VM (`n-cpu`) để tiết kiệm tài nguyên.
-*   **Compute Node (Ubuntu 26 - IP `192.168.1.101`)**: Chạy Nova Compute (`n-cpu`) và Neutron L2 Agent (`q-agt`). Đây là nơi các máy ảo (Instance) của người dùng chạy thực tế.
-*   **Client (macOS - IP `192.168.1.102`)**: Sử dụng để SSH điều khiển, chạy `openstack` CLI và mở Dashboard Horizon trên trình duyệt.
+Các thiết bị của chúng ta không nằm trong cùng một mạng LAN vật lý mà được kết nối qua mạng **Tailscale VPN (Virtual Private Network)**. Điều này cho phép các node giao tiếp trực tiếp một cách an toàn thông qua lớp mạng ảo mã hóa (mặc định dải IP của Tailscale nằm trong khoảng `100.64.0.0/10`):
 
-```mermaid
-graph TD
-    subgraph Mạng LAN Nội Bộ (Ví dụ: 192.168.1.0/24)
-        mac[macOS Client <br> 192.168.1.102]
-        minipc[Mini PC Control Node <br> 192.168.1.100]
-        ubuntu26[Ubuntu 26 Compute Node <br> 192.168.1.101]
-    end
-    
-    mac -->|SSH / OpenStack CLI / Horizon| minipc
-    mac -->|SSH| ubuntu26
-    
-    subgraph Kết Nối OpenStack (Overlay VXLAN)
-        minipc <===>|VXLAN Tunneling| ubuntu26
-    end
-    
-    subgraph Các Dịch Vụ Tại Control Node (Mini PC)
-        Keystone[Keystone - Auth]
-        Glance[Glance - Image]
-        Neutron[Neutron Server]
-        Horizon[Horizon UI]
-        Heat[Heat Orchestration]
-        Swift[Swift Object Store]
-        Cinder[Cinder API & Scheduler]
-    end
-    
-    subgraph Các Dịch Vụ Tại Compute Node (Ubuntu 26)
-        NovaCompute[Nova Compute n-cpu]
-        OVS[Neutron L2 Agent q-agt]
-        VM1[Tenant VM - Web Server]
-    end
-    
-    VM1 -.->|Chạy trên hypervisor| NovaCompute
-```
+*   **Control Node (Mini PC - Tailscale IP `100.99.10.20`)**: Chạy các dịch vụ quản lý như Keystone, Glance, Horizon, Neutron Server, Heat, Cinder API/Scheduler, Swift, MySQL và RabbitMQ. Tắt dịch vụ hypervisor/chạy VM (`n-cpu`) để tiết kiệm tài nguyên.
+*   **Compute Node (Ubuntu 26 - Tailscale IP `100.99.10.30`)**: Chạy Nova Compute (`n-cpu`) và Neutron L2 Agent (`q-agt`). Đây là nơi các máy ảo (Instance) chạy thực tế.
+*   **Client (macOS - Tailscale IP `100.99.10.40`)**: Dùng để SSH điều khiển, chạy `openstack` CLI và mở Dashboard Horizon trên trình duyệt.
+
 
 > [!IMPORTANT]
-> Hãy thay thế các địa chỉ IP `192.168.1.100` (Mini PC) và `192.168.1.101` (Ubuntu 26) trong suốt tài liệu này bằng IP thực tế trong mạng nội bộ của bạn.
+> **Lưu ý về MTU khi dùng Tailscale**: Tailscale VPN có MTU mặc định là **1280**. Khi bọc các gói tin mạng ảo OpenStack (VXLAN overlay) bên trong đường truyền Tailscale, chúng ta cần trừ đi 50 bytes header của VXLAN. Vì vậy, MTU của mạng OpenStack được cấu hình tối đa là **1200** (`global_physnet_mtu=1200` trong `local.conf`). Điều này giúp tránh hiện tượng phân mảnh gói tin gây lỗi mạng (chậm mạng, drop connection khi tải file từ Swift).
+
+> [!IMPORTANT]
+> Hãy thay thế các địa chỉ IP `100.99.10.20` (Mini PC) và `100.99.10.30` (Ubuntu 26) trong tài liệu này bằng địa chỉ IP Tailscale thực tế của bạn.
 
 ---
 
@@ -66,9 +37,9 @@ sudo ufw disable
 ```
 
 ### Bước 2.2: Cài Đặt Control Node (Mini PC)
-1. SSH vào Mini PC từ macOS:
+1. SSH vào Mini PC từ macOS thông qua Tailscale IP:
    ```bash
-   ssh user@192.168.1.100
+   ssh user@100.99.10.20
    ```
 2. Clone repository DevStack phiên bản `stable/2024.2`:
    ```bash
@@ -80,16 +51,16 @@ sudo ufw disable
    # Chép file local_controller.conf sang Mini PC đặt tên là local.conf
    ```
    > [!TIP]
-   > Hãy kiểm tra kỹ tham số `HOST_IP` trong file `local.conf` phải khớp với IP của Mini PC (`192.168.1.100`).
+   > Hãy kiểm tra kỹ tham số `HOST_IP` trong file `local.conf` phải khớp với IP Tailscale của Mini PC (`100.99.10.20`).
 4. Chạy script cài đặt (quá trình này mất khoảng 20 - 30 phút):
    ```bash
    ./stack.sh
    ```
 
 ### Bước 2.3: Cài Đặt Compute Node (Ubuntu 26)
-1. SSH vào máy Ubuntu 26 từ macOS:
+1. SSH vào máy Ubuntu 26 từ macOS thông qua Tailscale IP:
    ```bash
-   ssh user@192.168.1.101
+   ssh user@100.99.10.30
    ```
 2. Clone DevStack bản tương ứng:
    ```bash
@@ -98,7 +69,7 @@ sudo ufw disable
    ```
 3. Tạo file `local.conf` bằng cách sao chép nội dung từ file [`local_compute.conf`](file:///Users/caolegiaphu/Documents/cloud_aws/final_project/local_compute.conf):
    > [!TIP]
-   > Kiểm tra kỹ: `HOST_IP` phải là `192.168.1.101` (IP máy Ubuntu 26) và `SERVICE_HOST` phải là `192.168.1.100` (IP Control Node - Mini PC).
+   > Kiểm tra kỹ: `HOST_IP` phải là IP Tailscale của máy Ubuntu 26 (`100.99.10.30`) và `SERVICE_HOST` phải là IP Tailscale của Control Node - Mini PC (`100.99.10.20`).
 4. Chạy cài đặt sau khi Control Node đã chạy xong:
    ```bash
    ./stack.sh
@@ -124,7 +95,7 @@ pip install python-openstackclient python-heatclient python-swiftclient
 ```
 
 ### Bước 3.2: Tải File Xác Thực (OpenRC)
-1. Mở trình duyệt trên macOS truy cập Horizon Dashboard: `http://192.168.1.100/dashboard`
+1. Mở trình duyệt trên macOS truy cập Horizon Dashboard bằng Tailscale IP của Mini PC: `http://100.99.10.20/dashboard`
 2. Đăng nhập bằng tài khoản:
    *   Domain: `default`
    *   User: `admin`
@@ -140,14 +111,28 @@ pip install python-openstackclient python-heatclient python-swiftclient
    openstack service list
    ```
 
-### Bước 3.3: Thêm Route Tĩnh Để Truy Cập Floating IP từ macOS
-Mặc định, dải IP floating của các VM trong OpenStack là `172.24.4.0/24`. Dải này được định tuyến nội bộ bên trong Control Node qua bridge `br-ex`. 
-Để máy macOS của bạn có thể ping hoặc SSH trực tiếp vào các máy ảo này thông qua IP floating, hãy thêm một route trên macOS:
+### Bước 3.3: Định Tuyến Truy Cập Floating IP từ macOS Qua Tailscale
+Mặc định, dải IP floating của các VM trong OpenStack là `172.24.4.0/24`. Dải này được định tuyến nội bộ bên trong Control Node qua bridge `br-ex`. Có 2 cách để máy macOS truy cập được dải này qua Tailscale:
 
+#### Cách 1: Sử dụng Tailscale Subnet Router (Khuyên dùng - chuyên nghiệp nhất)
+Tailscale cho phép biến Control Node (Mini PC) thành một router chuyển tiếp dải mạng ảo vào mạng VPN.
+1. Trên Control Node (Mini PC), cấu hình quảng bá dải floating IP:
+   ```bash
+   sudo tailscale up --advertise-routes=172.24.4.0/24
+   ```
+2. Đăng nhập vào trang quản trị **Tailscale Admin Console** (https://login.tailscale.com) -> tìm thiết bị Mini PC của bạn -> Chọn mục **Edit Route Settings** -> Bật checkbox chấp nhận route `172.24.4.0/24`.
+3. Sau khi bật, máy macOS (và bất kỳ máy nào khác trong mạng Tailnet của bạn) sẽ tự động ping/SSH được tới các IP `172.24.4.x` mà không cần cấu hình thủ công gì thêm!
+
+#### Cách 2: Thêm Route Tĩnh Thủ Công Trên macOS
+Nếu không muốn dùng Subnet Router, bạn có thể định tuyến thủ công trên macOS bằng cách trỏ dải floating IP qua IP Tailscale của Mini PC:
 ```bash
-sudo route -n add 172.24.4.0/24 192.168.1.100
+sudo route -n add 172.24.4.0/24 100.99.10.20
 ```
-*(Lệnh này chỉ định: Mọi lưu lượng gửi đến `172.24.4.x` sẽ được chuyển tiếp qua Mini PC `192.168.1.100` để định tuyến vào OpenStack).*
+> [!NOTE]
+> Để cách này hoạt động, hãy chắc chắn rằng tính năng IP Forwarding đã được bật trên Mini PC:
+> ```bash
+> sudo sysctl -w net.ipv4.ip_forward=1
+> ```
 
 ---
 
@@ -307,9 +292,8 @@ openstack router add subnet project-router private-subnet
        ```bash
        # Phân quyền container sang chế độ cho phép đọc public (đọc trực tiếp không cần token)
        openstack container set --read-acl ".r:*" tetris-src
-       
-       # Địa chỉ tải file từ máy ảo sẽ có dạng:
-       # http://192.168.1.100:8080/v1/AUTH_<PROJECT_ID>/tetris-src/index.html
+       # Địa chỉ tải file từ máy ảo sẽ có dạng (sử dụng Tailscale IP của Control Node):
+       # http://100.99.10.20:8080/v1/AUTH_<PROJECT_ID>/tetris-src/index.html
        ```
 
 2. **Làm việc với Cinder (Block Storage)**:
@@ -335,7 +319,7 @@ openstack router add subnet project-router private-subnet
        # Tải code từ Swift về ổ đĩa này
        # Thay đổi URL bằng thông tin Swift của bạn
        PROJECT_ID=$(openstack project show demo -f value -c id) # Hoặc project admin
-       sudo wget -O /var/www/html/index.html http://192.168.1.100:8080/v1/AUTH_${PROJECT_ID}/tetris-src/index.html
+       sudo wget -O /var/www/html/index.html http://100.99.10.20:8080/v1/AUTH_${PROJECT_ID}/tetris-src/index.html
        
        # Chạy lại HTTP Server trên thư mục mới này
        cd /var/www/html
@@ -381,7 +365,7 @@ openstack router add subnet project-router private-subnet
    # Lấy ID hoặc tên của Keypair đã tạo ở Module 3 (ví dụ: mykey)
    # Truyền link code từ Swift (hoặc bỏ trống để dùng trang Hello World mặc định)
    PROJECT_ID=$(openstack project show admin -f value -c id) # hoặc demo
-   CODE_LINK="http://192.168.1.100:8080/v1/AUTH_${PROJECT_ID}/tetris-src/index.html"
+   CODE_LINK="http://100.99.10.20:8080/v1/AUTH_${PROJECT_ID}/tetris-src/index.html"
    
    openstack stack create -t module5_service.yaml \
      --parameter key_name=mykey \
@@ -419,4 +403,4 @@ openstack router add subnet project-router private-subnet
     *   *Khắc phục*: Trên Control Node, chạy lệnh `openstack hypervisor list`. Đảm bảo thấy dòng thông tin của Compute Node (Ubuntu 26) ở trạng thái `State: up` và `Status: enabled`.
 3.  **Lỗi không thể ping/SSH máy ảo từ macOS mặc dù đã gán Floating IP**:
     *   *Nguyên nhân*: Thiếu cấu hình route tĩnh trên macOS hoặc chưa mở Security Group.
-    *   *Khắc phục*: Chạy lại lệnh thêm route tĩnh `sudo route -n add 172.24.4.0/24 192.168.1.100` trên macOS. Đảm bảo Security Group của máy ảo đã mở cổng 22 và giao thức ICMP.
+    *   *Khắc phục*: Kiểm tra xem tính năng Subnet Router trên Tailscale đã được bật và phê duyệt chưa. Nếu cấu hình thủ công, hãy chạy lại lệnh thêm route tĩnh `sudo route -n add 172.24.4.0/24 100.99.10.20` trên macOS và đảm bảo IP Forwarding đã được bật trên Control Node. Đảm bảo Security Group của máy ảo đã mở cổng 22 và giao thức ICMP.
