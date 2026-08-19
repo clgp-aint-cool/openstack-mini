@@ -12,6 +12,46 @@ Các thiết bị của chúng ta không nằm trong cùng một mạng LAN vậ
 *   **Compute Node (Ubuntu 26 - Tailscale IP `100.99.10.30`)**: Chạy Nova Compute (`n-cpu`) và Neutron L2 Agent (`q-agt`). Đây là nơi các máy ảo (Instance) chạy thực tế.
 *   **Client (macOS - Tailscale IP `100.99.10.40`)**: Dùng để SSH điều khiển, chạy `openstack` CLI và mở Dashboard Horizon trên trình duyệt.
 
+```mermaid
+graph TD
+    %% Định nghĩa Class màu sắc cho sơ đồ
+    classDef controller_style fill:#1e3d59,stroke:#17b978,stroke-width:2px,color:#fff;
+    classDef compute_style fill:#ff6f3c,stroke:#ff9a3c,stroke-width:2px,color:#fff;
+    classDef client_style fill:#17b978,stroke:#1e3d59,stroke-width:2px,color:#fff;
+    classDef service_style fill:#ececec,stroke:#1e3d59,stroke-width:1px,color:#333;
+    classDef net_style fill:#ffc93c,stroke:#ff6f3c,stroke-width:2px,color:#333;
+
+    subgraph "Mạng VPN Tailscale (Dải 100.64.0.0/10)"
+        mac["macOS Client<br>(Tailscale: 100.99.10.40)"]:::client_style
+        minipc["Mini PC Control Node<br>(Tailscale: 100.99.10.20)"]:::controller_style
+        ubuntu26["Ubuntu 26 Compute Node<br>(Tailscale: 100.99.10.30)"]:::compute_style
+    end
+
+    mac -->|SSH / CLI / Horizon| minipc
+    mac -->|SSH| ubuntu26
+
+    subgraph "Kết Nối OpenStack (Overlay VXLAN qua Tailscale)"
+        minipc <===>|VXLAN Tunneling (1200 MTU)| ubuntu26
+    end
+
+    subgraph "Các Dịch Vụ Tại Control Node (Mini PC)"
+        Keystone["Keystone - Auth"]:::service_style
+        Glance["Glance - Image"]:::service_style
+        Neutron["Neutron Server"]:::service_style
+        Horizon["Horizon UI"]:::service_style
+        Heat["Heat Orchestration"]:::service_style
+        Swift["Swift Object Store"]:::service_style
+        Cinder["Cinder API & Scheduler"]:::service_style
+    end
+
+    subgraph "Các Dịch Vụ Tại Compute Node (Ubuntu 26)"
+        NovaCompute["Nova Compute n-cpu"]:::service_style
+        OVS["Neutron L2 Agent q-agt"]:::service_style
+        VM1["Tenant VM - Web Server"]:::net_style
+    end
+
+    VM1 -.->|Chạy trên hypervisor| NovaCompute
+```
 
 > [!IMPORTANT]
 > **Lưu ý về MTU khi dùng Tailscale**: Tailscale VPN có MTU mặc định là **1280**. Khi bọc các gói tin mạng ảo OpenStack (VXLAN overlay) bên trong đường truyền Tailscale, chúng ta cần trừ đi 50 bytes header của VXLAN. Vì vậy, MTU của mạng OpenStack được cấu hình tối đa là **1200** (`global_physnet_mtu=1200` trong `local.conf`). Điều này giúp tránh hiện tượng phân mảnh gói tin gây lỗi mạng (chậm mạng, drop connection khi tải file từ Swift).
@@ -74,6 +114,36 @@ sudo ufw disable
    ```bash
    ./stack.sh
    ```
+
+### Bước 2.4: Kết Nối Thiết Bị Giữa 2 Tài Khoản Tailscale Khác Nhau (2 Người Dùng)
+
+Nếu bạn và đồng đội sử dụng 2 tài khoản Tailscale cá nhân khác nhau (ví dụ đăng nhập bằng 2 email Google/GitHub khác nhau), có 2 cách để đưa các thiết bị vào chung một mạng VPN Tailscale nhằm triển khai Multi-Node:
+
+#### Cách 1: Mời thành viên tham gia chung Tailnet (Khuyên dùng - Đơn giản và ổn định nhất)
+Tailscale cho phép tài khoản cá nhân mời thêm tối đa 3 thành viên tham gia vào mạng Tailnet của mình hoàn toàn miễn phí. Khi tham gia chung Tailnet, tất cả thiết bị của cả hai bạn sẽ tự động kết nối và giao tiếp hai chiều.
+1. **Người thứ nhất (Chủ mạng)**:
+   * Truy cập trang quản trị **Tailscale Admin Console** (https://login.tailscale.com).
+   * Vào tab **Users** -> Chọn **Invite Users**.
+   * Sao chép link mời và gửi cho **Người thứ hai**.
+2. **Người thứ hai (Thành viên được mời)**:
+   * Nhấp vào link mời và đăng nhập bằng tài khoản Tailscale cá nhân của mình.
+   * Đồng ý tham gia vào mạng Tailnet của Người thứ nhất.
+3. **Cấu hình trên thiết bị**:
+   * Khi đăng nhập ứng dụng Tailscale trên máy tính (Mini PC, Ubuntu 26, macOS), cả hai bạn chỉ cần đảm bảo chọn đúng mạng (Tailnet) của Người thứ nhất trong menu ứng dụng (thông thường ứng dụng sẽ cho phép chuyển đổi giữa Tailnet cá nhân và Tailnet được mời).
+   * Lúc này, các thiết bị sẽ giao tiếp hai chiều mượt mà bằng IP Tailscale.
+
+#### Cách 2: Chia sẻ thiết bị riêng lẻ (Node Sharing)
+Nếu không muốn gộp chung mạng Tailnet, các bạn có thể chia sẻ quyền truy cập riêng lẻ của từng thiết bị.
+1. **Người thứ nhất (ví dụ sở hữu Mini PC - Control Node)**:
+   * Vào **Tailscale Admin Console** -> tìm thiết bị Mini PC.
+   * Nhấp vào biểu tượng dấu 3 chấm `...` bên cạnh thiết bị -> chọn **Share...** -> nhấn **Generate share link**.
+   * Gửi link này cho **Người thứ hai** (sở hữu máy Compute Node).
+2. **Người thứ hai**:
+   * Mở link nhận chia sẻ và bấm **Accept**. Thiết bị Mini PC sẽ xuất hiện trong danh sách thiết bị của bạn.
+   * **Quan trọng**: Để Control Node có thể điều khiển ngược lại Compute Node, Người thứ hai cũng phải thực hiện **Share ngược lại** máy Ubuntu 26 của mình cho Người thứ nhất chấp nhận.
+
+> [!WARNING]
+> Phương thức Node Sharing (Cách 2) yêu cầu chia sẻ chéo hai chiều và đôi khi bị giới hạn bởi chính sách bảo mật mặc định của Tailscale đối với các kết nối từ bên ngoài (Shared Node). Do đó, hãy ưu tiên chọn **Cách 1** để đảm bảo quá trình cài đặt DevStack không gặp lỗi kết nối dịch vụ.
 
 ---
 
