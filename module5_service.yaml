@@ -1,0 +1,220 @@
+heat_template_version: 2021-04-16
+
+description: >
+  Heat Orchestration Template (HOT) for CSC11006 - Project 2 (Module 5).
+  Deploys a dual-homed web server (DMZ and Private networks), attaches a Cinder volume,
+  allocates a floating IP, and uses cloud-init to mount the volume and host a web app.
+
+parameters:
+  image:
+    type: string
+    description: Image name or ID to use for the web server
+    default: ubuntu-22.04
+  flavor:
+    type: string
+    description: Flavor name or ID to use for the web server
+    default: m1.small
+  key_name:
+    type: string
+    description: Name of keypair to enable SSH access
+  public_net:
+    type: string
+    description: Name or ID of the public/external network
+    default: public
+  code_url:
+    type: string
+    description: URL of the code/HTML to deploy on the web server
+    default: ""
+
+resources:
+  # ==========================================
+  # NETWORKING RESOURCES
+  # ==========================================
+  dmz_net:
+    type: OS::Neutron::Net
+    properties:
+      name: dmz-net
+
+  dmz_subnet:
+    type: OS::Neutron::Subnet
+    properties:
+      name: dmz-subnet
+      network: { get_resource: dmz_net }
+      cidr: 10.0.1.0/24
+      gateway_ip: 10.0.1.1
+      dns_nameservers: [8.8.8.8, 1.1.1.1]
+
+  private_net:
+    type: OS::Neutron::Net
+    properties:
+      name: private-net
+
+  private_subnet:
+    type: OS::Neutron::Subnet
+    properties:
+      name: private-subnet
+      network: { get_resource: private_net }
+      cidr: 10.0.2.0/24
+      gateway_ip: 10.0.2.1
+      dns_nameservers: [8.8.8.8, 1.1.1.1]
+
+  # Router connecting both networks to the public gateway
+  router:
+    type: OS::Neutron::Router
+    properties:
+      name: project-router
+      external_gateway_info:
+        network: { get_param: public_net }
+
+  router_interface_dmz:
+    type: OS::Neutron::RouterInterface
+    properties:
+      router: { get_resource: router }
+      subnet: { get_resource: dmz_subnet }
+
+  router_interface_private:
+    type: OS::Neutron::RouterInterface
+    properties:
+      router: { get_resource: router }
+      subnet: { get_resource: private_subnet }
+
+  # ==========================================
+  # SECURITY GROUPS AND PORTS
+  # ==========================================
+  web_secgroup:
+    type: OS::Neutron::SecurityGroup
+    properties:
+      name: web-secgroup
+      description: Allow SSH (22), HTTP (80), and ICMP traffic
+      rules:
+        - protocol: tcp
+          port_range_min: 22
+          port_range_max: 22
+          remote_ip_prefix: 0.0.0.0/0
+        - protocol: tcp
+          port_range_min: 80
+          port_range_max: 80
+          remote_ip_prefix: 0.0.0.0/0
+        - protocol: icmp
+          remote_ip_prefix: 0.0.0.0/0
+
+  dmz_port:
+    type: OS::Neutron::Port
+    properties:
+      network: { get_resource: dmz_net }
+      fixed_ips:
+        - subnet: { get_resource: dmz_subnet }
+      security_groups:
+        - { get_resource: web_secgroup }
+
+  private_port:
+    type: OS::Neutron::Port
+    properties:
+      network: { get_resource: private_net }
+      fixed_ips:
+        - subnet: { get_resource: private_subnet }
+
+  # ==========================================
+  # STORAGE RESOURCES
+  # ==========================================
+  cinder_volume:
+    type: OS::Cinder::Volume
+    properties:
+      name: web-data-volume
+      size: 1
+      description: Block storage for web server application code
+
+  # ==========================================
+  # COMPUTE INSTANCE & VOL ATTACHMENT
+  # ==========================================
+  web_server:
+    type: OS::Nova::Server
+    properties:
+      name: web-server
+      image: { get_param: image }
+      flavor: { get_param: flavor }
+      key_name: { get_param: key_name }
+      networks:
+        - port: { get_resource: dmz_port }
+        - port: { get_resource: private_port }
+      user_data_format: RAW
+      user_data:
+        str_replace:
+          template: |
+            #!/bin/bash
+            # Wait for interfaces to settle and receive IP addresses
+            sleep 10
+
+            # 1. FIX DUAL-HOMED ROUTING (Asymmetric Routing Fix)
+            # Remove the default route via private-subnet (10.0.2.1)
+            # This ensures only the DMZ-facing interface (10.0.1.1) holds the default route
+            ip route del default via 10.0.2.1 || true
+
+            # 2. FORMAT AND MOUNT CINDER VOLUME
+            # Wait for the volume /dev/vdb to attach (timeout ~60 seconds)
+            for i in {1..30}; do
+              if [ -b /dev/vdb ]; then
+                break
+              fi
+              sleep 2
+            done
+
+            if [ -b /dev/vdb ]; then
+              # Format volume to ext4
+              mkfs.ext4 /dev/vdb
+              # Create mount directory
+              mkdir -p /var/www/html
+              # Mount Cinder volume
+              mount /dev/vdb /var/www/html
+              # Add entry to fstab for automatic mount on boot
+              echo "/dev/vdb /var/www/html ext4 defaults,nofail 0 2" >> /etc/fstab
+            else
+              # Fallback if volume didn't attach in time
+              mkdir -p /var/www/html
+            fi
+
+            # 3. SET UP WEB SERVICE CONTENT
+            # Write a default page
+            echo "<h1>Hello World from OpenStack Heat Orchestration!</h1>" > /var/www/html/index.html
+            echo "<p>Cinder volume is successfully mounted at <code>/var/www/html</code></p>" >> /var/www/html/index.html
+            echo "<p>Web server has 2 interfaces: DMZ (dmz-net) and Private (private-net).</p>" >> /var/www/html/index.html
+
+            # Download application code from code_url parameter if provided
+            if [ -n "$CODE_URL" ]; then
+              wget -O /var/www/html/index.html "$CODE_URL" || curl -L -o /var/www/html/index.html "$CODE_URL"
+            fi
+
+            # 4. RUN A LIGHTWEIGHT HTTP SERVER
+            cd /var/www/html
+            nohup python3 -m http.server 80 > /var/log/http-server.log 2>&1 &
+          params:
+            $CODE_URL: { get_param: code_url }
+
+  volume_attachment:
+    type: OS::Nova::VolumeAttachment
+    properties:
+      instance_uuid: { get_resource: web_server }
+      volume_id: { get_resource: cinder_volume }
+      mountpoint: /dev/vdb
+
+  # ==========================================
+  # FLOATING IP CONFIGURATION
+  # ==========================================
+  floating_ip:
+    type: OS::Neutron::FloatingIP
+    properties:
+      floating_network: { get_param: public_net }
+
+  floating_ip_association:
+    type: OS::Neutron::FloatingIPAssociation
+    properties:
+      floatingip_id: { get_resource: floating_ip }
+      port_id: { get_resource: dmz_port }
+
+outputs:
+  web_server_private_ip:
+    description: Private IP address of the web server on DMZ network
+    value: { get_attr: [web_server, first_address] }
+  web_server_floating_ip:
+    description: Floating IP address of the web server
+    value: { get_attr: [floating_ip, floating_ip_address] }
