@@ -81,9 +81,9 @@ sudo ufw disable
    ```bash
    ssh user@100.99.10.20
    ```
-2. Clone repository DevStack phiên bản `stable/2024.2`:
+2. Clone repository DevStack phiên bản `stable/2025.2`:
    ```bash
-   git clone https://opendev.org/openstack/devstack -b stable/2024.2
+   git clone https://opendev.org/openstack/devstack -b stable/2025.2
    cd devstack
    ```
 3. Tạo file `local.conf` bằng cách sao chép nội dung từ file [`local_controller.conf`](file:///Users/caolegiaphu/Documents/cloud_aws/final_project/local_controller.conf) mà chúng ta đã chuẩn bị:
@@ -104,7 +104,7 @@ sudo ufw disable
    ```
 2. Clone DevStack bản tương ứng:
    ```bash
-   git clone https://opendev.org/openstack/devstack -b stable/2024.2
+   git clone https://opendev.org/openstack/devstack -b stable/2025.2
    cd devstack
    ```
 3. Tạo file `local.conf` bằng cách sao chép nội dung từ file [`local_compute.conf`](file:///Users/caolegiaphu/Documents/cloud_aws/final_project/local_compute.conf):
@@ -474,3 +474,78 @@ openstack router add subnet project-router private-subnet
 3.  **Lỗi không thể ping/SSH máy ảo từ macOS mặc dù đã gán Floating IP**:
     *   *Nguyên nhân*: Thiếu cấu hình route tĩnh trên macOS hoặc chưa mở Security Group.
     *   *Khắc phục*: Kiểm tra xem tính năng Subnet Router trên Tailscale đã được bật và phê duyệt chưa. Nếu cấu hình thủ công, hãy chạy lại lệnh thêm route tĩnh `sudo route -n add 172.24.4.0/24 100.99.10.20` trên macOS và đảm bảo IP Forwarding đã được bật trên Control Node. Đảm bảo Security Group của máy ảo đã mở cổng 22 và giao thức ICMP.
+4.  **Lỗi cài đặt thất bại giữa chừng / Keystone "503 Service Unavailable" (Lỗi thiếu RAM / OOM Killer)**:
+    *   *Triệu chứng*: Khi đang chạy `./stack.sh`, hệ thống bị treo, máy ảo tự tắt/reboot, hoặc báo lỗi `HttpException: 503 ... The Keystone service is temporarily unavailable`.
+    *   *Nguyên nhân*: DevStack tiêu thụ rất nhiều RAM (tối thiểu 10GB-16GB để chạy các dịch vụ điều khiển mượt mà). Trên máy ảo của bạn, bộ nhớ RAM chỉ có **7 GiB** và đã bị chiếm dụng tới **91.38% (6.40 GiB)**. Cơ chế **OOM (Out Of Memory) Killer** của Linux đã tự động ép tắt các dịch vụ quan trọng (như Keystone, MySQL, RabbitMQ) để tránh sập kernel, dẫn đến quá trình cài đặt bị hỏng.
+    *   *Khắc phục*:
+        *   **Cách 1: Tăng RAM trong Proxmox VE (Khuyên dùng)**: Tắt VM, vào Proxmox chỉnh sửa cấu hình phần cứng (Hardware -> Memory) để tăng RAM lên tối thiểu **10 GB - 12 GB** (nếu cấu hình vật lý Mini PC cho phép).
+        *   **Cách 2: Cấu hình giới hạn tiến trình API (Cực kỳ hiệu quả)**:
+            Mặc định, DevStack sẽ tự động tạo số lượng tiến trình xử lý (API workers) bằng số nhân CPU của VM cho mỗi dịch vụ. Với 4 vCPU và nhiều dịch vụ chạy cùng lúc (Keystone, Nova, Neutron, Cinder, Swift, Heat), hệ thống sẽ tạo ra hàng chục tiến trình Python chạy ngầm ngốn hết RAM.
+            Hãy thêm cấu hình sau vào file `local.conf` của bạn (đã được cấu hình sẵn trong [`local_controller.conf`](file:///Users/caolegiaphu/Documents/cloud_aws/final_project/local_controller.conf)):
+            ```ini
+            API_WORKERS=1
+            ```
+            Cấu hình này ép mỗi dịch vụ OpenStack chỉ chạy duy nhất 1 tiến trình xử lý, giúp tiết kiệm tới 60% - 70% dung lượng RAM tiêu hao của Control Node.
+        *   **Cách 3: Tạo Swap File (Bắt buộc nếu không thể tăng RAM vật lý)**:
+            Tạo một bộ nhớ ảo (Swap) 12GB trên ổ đĩa để cứu cánh khi RAM vật lý bị quá tải. Thực hiện các lệnh sau trên Control Node:
+            ```bash
+            sudo swapoff -a  # Tắt swap cũ nếu có
+            sudo dd if=/dev/zero of=/swapfile bs=1M count=12288  # Tạo file swap 12GB
+            sudo chmod 600 /swapfile
+            sudo mkswap /swapfile
+            sudo swapon /swapfile
+            # Cấu hình tự động nhận swap khi khởi động lại máy
+            echo '/swapfile none swap sw 0 0' | sudo tee -a /etc/fstab
+            ```
+            Kiểm tra lại bằng lệnh `free -h` để đảm bảo cột Swap hiển thị dung lượng khoảng 12G.
+        *   **Cách 3: Dọn dẹp bản cài lỗi trước khi cài lại**:
+            Khi cài đặt bị lỗi nửa chừng, các database và dịch vụ cấu hình dở dang sẽ xung đột. Bạn **bắt buộc** phải chạy dọn dẹp trước khi chạy lại `./stack.sh`:
+            ```bash
+            cd ~/devstack
+            ./unstack.sh
+            ./clean.sh
+            ```
+        *   **Cách 4: Chạy lại `./stack.sh`**:
+            Sau khi tăng RAM/Swap và dọn dẹp xong, thực hiện chạy lại:
+            ```bash
+            ./stack.sh
+            ```
+        *   **Cách 5: Xem log chính xác của Keystone bằng systemd**:
+            Trong DevStack bản mới, logs không ghi vào `/opt/stack/logs/keystone.log` mà được quản lý bởi systemd. Xem log bằng lệnh:
+            ```bash
+            # Xem log dịch vụ keystone
+            journalctl -u devstack@keystone.service -n 100 --no-pager
+            # Xem log webserver Apache (nơi chạy Keystone API)
+            sudo tail -n 100 /var/log/apache2/keystone_access.log
+            ```
+5.  **Lỗi Neutron API crash liên tục / `Geneve max_header_size set too low for OVN (30 vs 38)`**:
+    *   *Triệu chứng*: Khi khởi chạy Neutron API, tiến trình uWSGI liên tục bị sập và khởi động lại (`worker died ... trying respawn`). Log dịch vụ hiển thị lỗi nghiêm trọng: `CRITICAL neutron.plugins.ml2.drivers.ovn.mech_driver.mech_driver ... Geneve max_header_size set too low for OVN (30 vs 38)`.
+    *   *Nguyên nhân*: Trong các phiên bản DevStack mới, OVN được sử dụng làm cơ chế điều khiển mạng mặc định. Giao thức đường hầm Geneve của OVN yêu cầu kích thước tiêu đề (header size) tối thiểu là 38 bytes để mang siêu dữ liệu (metadata), trong khi giá trị mặc định của hệ thống chỉ cấu hình là 30 bytes.
+    *   *Khắc phục*:
+        1.  **Sửa cấu hình trực tiếp để cứu dịch vụ đang chạy**:
+            Thực thi đoạn mã Python sau trên Control Node để tự động ghi đè giá trị `max_header_size = 38` vào file cấu hình của Neutron:
+            ```bash
+            sudo python3 -c "
+            import configparser
+            config = configparser.ConfigParser()
+            config.read('/etc/neutron/plugins/ml2/ml2_conf.ini')
+            if not config.has_section('ml2_type_geneve'):
+                config.add_section('ml2_type_geneve')
+            config.set('ml2_type_geneve', 'max_header_size', '38')
+            with open('/etc/neutron/plugins/ml2/ml2_conf.ini', 'w') as f:
+                config.write(f)
+            "
+            ```
+        2.  **Khởi động lại dịch vụ Neutron API**:
+            ```bash
+            sudo systemctl restart devstack@neutron-api.service
+            ```
+        3.  **Cấu hình lâu dài trong `local.conf`**:
+            Để tránh việc DevStack ghi đè lại giá trị lỗi này ở các lần cài đặt sau, hãy chắc chắn file `local.conf` của bạn đã được bổ sung khối cấu hình sau (đã có sẵn trong file [`local_controller.conf`](file:///Users/caolegiaphu/Documents/cloud_aws/final_project/local_controller.conf)):
+            ```ini
+            [[post-config|/etc/neutron/plugins/ml2/ml2_conf.ini]]
+            [ml2_type_geneve]
+            max_header_size = 38
+            ```
+
+
